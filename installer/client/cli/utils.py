@@ -34,6 +34,8 @@ class Standalone:
         """
 
         # Expand the tilde to the full path
+        if args is None:
+            args = type('Args', (), {})()
         env_file = os.path.expanduser(env_file)
         load_dotenv(env_file)
         assert 'OPENAI_API_KEY' in os.environ, "Error: OPENAI_API_KEY not found in environment variables. Please run fabric --setup and add a key."
@@ -45,18 +47,15 @@ class Standalone:
         self.config_pattern_directory = config_directory
         self.pattern = pattern
         self.args = args
-        self.model = None
-        if args.model:
-            self.model = args.model
-        else:
-            try:
-                self.model = os.environ["DEFAULT_MODEL"]
-            except:
+        self.model = getattr(args, 'model', None)
+        if not self.model:
+            self.model = os.environ.get('DEFAULT_MODEL', None)
+            if not self.model:
                 self.model = 'gpt-4-turbo-preview'
         self.claude = False
         sorted_gpt_models, ollamaList, claudeList = self.fetch_available_models()
-        self.local = self.model.strip() in ollamaList
-        self.claude = self.model.strip() in claudeList
+        self.local = self.model in ollamaList
+        self.claude = self.model in claudeList
 
     async def localChat(self, messages, host=''):
         from ollama import AsyncClient
@@ -278,9 +277,12 @@ class Standalone:
         gptlist = []
         fullOllamaList = []
         claudeList = ['claude-3-opus-20240229',
-                      'claude-3-sonnet-20240229', 'claude-2.1']
+                      'claude-3-sonnet-20240229',
+                      'claude-3-haiku-20240307',
+                      'claude-2.1']
         try:
-            models = [model.id for model in self.client.models.list().data]
+            models = [model.id.strip()
+                      for model in self.client.models.list().data]
         except APIConnectionError as e:
             if getattr(e.__cause__, 'args', [''])[0] == "Illegal header value b'Bearer '":
                 print("Error: Cannot connect to the OpenAI API Server because the API key is not set. Please run fabric --setup and add a key.")
@@ -298,7 +300,8 @@ class Standalone:
                 "/") + 1:] if "/" in item else item[item.rfind("\\") + 1:] for item in models]
         else:
             # Keep items that start with "gpt"
-            gptlist = [item for item in models if item.startswith("gpt")]
+            gptlist = [item.strip()
+                       for item in models if item.startswith("gpt")]
         gptlist.sort()
         import ollama
         try:
@@ -430,10 +433,6 @@ class Setup:
             self.openaiapi_key = openaiapikey
         except:
             pass
-        try:
-            self.fetch_available_models()
-        except:
-            pass
 
     def update_shconfigs(self):
         bootstrap_file = os.path.join(
@@ -448,37 +447,6 @@ class Setup:
                     if sourceLine not in line:
                         f.write(line)
                 f.write(sourceLine)
-
-    def fetch_available_models(self):
-        try:
-            models = [model.id for model in self.client.models.list().data]
-        except APIConnectionError as e:
-            if getattr(e.__cause__, 'args', [''])[0] == "Illegal header value b'Bearer '":
-                print("Error: Cannot connect to the OpenAI API Server because the API key is not set. Please run fabric --setup and add a key.")
-            else:
-                print(
-                    f"Error: {e.message} trying to access {e.request.url}: {getattr(e.__cause__, 'args', [''])}")
-            sys.exit()
-        except Exception as e:
-            print(f"Error: {getattr(e.__context__, 'args', [''])[0]}")
-            sys.exit()
-        if "/" in models[0] or "\\" in models[0]:
-            # lmstudio returns full paths to models. Iterate and truncate everything before and including the last slash
-            self.gptlist = [item[item.rfind(
-                "/") + 1:] if "/" in item else item[item.rfind("\\") + 1:] for item in models]
-        else:
-            # Keep items that start with "gpt"
-            self.gptlist = [item for item in models if item.startswith("gpt")]
-        self.gptlist.sort()
-        import ollama
-        try:
-            default_modelollamaList = ollama.list()['models']
-            for model in default_modelollamaList:
-                self.fullOllamaList.append(model['name'])
-        except:
-            self.fullOllamaList = []
-        allmodels = self.gptlist + self.fullOllamaList + self.claudeList
-        return allmodels
 
     def api_key(self, api_key):
         """        Set the OpenAI API key in the environment file.
@@ -564,39 +532,43 @@ class Setup:
             model (str): The model to be set.
         """
         model = model.strip()
+        env = os.path.expanduser("~/.config/fabric/.env")
+        standalone = Standalone(args=[], pattern="")
+        gpt, ollama, claude = standalone.fetch_available_models()
+        allmodels = gpt + ollama + claude
+        if model not in allmodels:
+            print(
+                f"Error: {model} is not a valid model. Please run fabric --listmodels to see the available models.")
+            sys.exit()
+
+        # Only proceed if the model is not empty
         if model:
-            # Write or update the DEFAULT_MODEL in env_file
-            allModels = self.claudeList + self.fullOllamaList + self.gptlist
-            if model not in allModels:
-                print(
-                    f"Error: {model} is not a valid model. Please run fabric --listmodels to see the available models.")
-                sys.exit()
+            if os.path.exists(env):
+                # Initialize a flag to track the presence of DEFAULT_MODEL
+                there = False
+                with open(env, "r") as f:
+                    lines = f.readlines()
 
-        # Compile regular expressions outside of the loop for efficiency
-
-        # Check for shell configuration files
-        if os.path.exists(os.path.expanduser("~/.config/fabric/.env")):
-            env = os.path.expanduser("~/.config/fabric/.env")
-            there = False
-            with open(env, "r") as f:
-                lines = f.readlines()
-                if "DEFAULT_MODEL" in lines:
-                    there = True
-            if there:
+                # Open the file again to write the changes
                 with open(env, "w") as f:
                     for line in lines:
-                        modified_line = line
-                        # Update existing fabric commands
-                        if "DEFAULT_MODEL" in line:
-                            modified_line = f'DEFAULT_MODEL={model}\n'
-                        f.write(modified_line)
+                        # Check each line to see if it contains DEFAULT_MODEL
+                        if "DEFAULT_MODEL=" in line:
+                            # Update the flag and the line with the new model
+                            there = True
+                            f.write(f'DEFAULT_MODEL={model}\n')
+                        else:
+                            # If the line does not contain DEFAULT_MODEL, write it unchanged
+                            f.write(line)
+
+                    # If DEFAULT_MODEL was not found in the file, add it
+                    if not there:
+                        f.write(f'DEFAULT_MODEL={model}\n')
+
+                print(
+                    f"Default model changed to {model}. Please restart your terminal to use it.")
             else:
-                with open(env, "a") as f:
-                    f.write(f'DEFAULT_MODEL={model}\n')
-            print(f"""Default model changed to {
-                  model}. Please restart your terminal to use it.""")
-        else:
-            print("No shell configuration file found.")
+                print("No shell configuration file found.")
 
     def patterns(self):
         """        Method to update patterns and exit the system.
